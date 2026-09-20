@@ -1,6 +1,8 @@
 """Tune an XGBoost pipeline, track it with MLflow and register it on Hugging Face."""
 import os
 import json
+import io
+import contextlib
 import joblib
 import mlflow
 import pandas as pd
@@ -11,7 +13,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import classification_report, roc_auc_score
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, hf_hub_download
 
 DATASET_NAME = "tourism-package-prediction"
 MODEL_NAME = "tourism-package-model"
@@ -27,12 +29,11 @@ hf_user = api.whoami()["name"]
 dataset_repo = f"{hf_user}/{DATASET_NAME}"
 model_repo = f"{hf_user}/{MODEL_NAME}"
 
-# Load the train and test data from the Hugging Face data space
-base = f"hf://datasets/{dataset_repo}"
-Xtrain = pd.read_csv(f"{base}/Xtrain.csv")
-Xtest = pd.read_csv(f"{base}/Xtest.csv")
-ytrain = pd.read_csv(f"{base}/ytrain.csv").squeeze()
-ytest = pd.read_csv(f"{base}/ytest.csv").squeeze()
+# Load prepared train/test files from the Hugging Face dataset repository.
+Xtrain = pd.read_csv(hf_hub_download(repo_id=dataset_repo, filename="Xtrain.csv", repo_type="dataset"))
+Xtest = pd.read_csv(hf_hub_download(repo_id=dataset_repo, filename="Xtest.csv", repo_type="dataset"))
+ytrain = pd.read_csv(hf_hub_download(repo_id=dataset_repo, filename="ytrain.csv", repo_type="dataset")).squeeze()
+ytest = pd.read_csv(hf_hub_download(repo_id=dataset_repo, filename="ytest.csv", repo_type="dataset")).squeeze()
 
 numeric_features = [
     "Age", "CityTier", "DurationOfPitch", "NumberOfPersonVisiting",
@@ -51,7 +52,12 @@ preprocessor = make_column_transformer(
     (make_pipeline(SimpleImputer(strategy="most_frequent"),
                    OneHotEncoder(handle_unknown="ignore")), categorical_features),
 )
-xgb_model = xgb.XGBClassifier(scale_pos_weight=class_weight, random_state=42, eval_metric="logloss")
+
+xgb_model = xgb.XGBClassifier(
+    scale_pos_weight=class_weight,
+    random_state=42,
+    eval_metric="logloss"
+)
 
 param_grid = {
     "xgbclassifier__n_estimators": [100, 200],
@@ -61,31 +67,38 @@ param_grid = {
     "xgbclassifier__learning_rate": [0.05, 0.1],
     "xgbclassifier__reg_lambda": [0.5, 1.0],
 }
+
 model_pipeline = make_pipeline(preprocessor, xgb_model)
 
 with mlflow.start_run(run_name="production-training"):
-    grid_search = GridSearchCV(model_pipeline, param_grid, cv=5, scoring="f1", n_jobs=-1)
+    # Single-process GridSearch prevents loky resource-tracker warnings in newer Python runtimes.
+    grid_search = GridSearchCV(
+        model_pipeline, param_grid, cv=5, scoring="f1", n_jobs=1
+    )
     grid_search.fit(Xtrain, ytrain)
 
-    # Log all tuned parameter combinations as nested runs
+    # Log all tuned parameter combinations as nested runs without flooding CI logs.
     results = grid_search.cv_results_
-    for i in range(len(results["params"])):
-        with mlflow.start_run(nested=True):
-            mlflow.log_params(results["params"][i])
-            mlflow.log_metric("mean_test_score", results["mean_test_score"][i])
-            mlflow.log_metric("std_test_score", results["std_test_score"][i])
+    sink = io.StringIO()
+    with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+        for i in range(len(results["params"])):
+            with mlflow.start_run(nested=True):
+                mlflow.log_params(results["params"][i])
+                mlflow.log_metric("mean_test_score", results["mean_test_score"][i])
+                mlflow.log_metric("std_test_score", results["std_test_score"][i])
 
     mlflow.log_params(grid_search.best_params_)
     mlflow.log_param("classification_threshold", CLASSIFICATION_THRESHOLD)
     best_model = grid_search.best_estimator_
 
-    # Evaluate with the business threshold
     train_proba = best_model.predict_proba(Xtrain)[:, 1]
     test_proba = best_model.predict_proba(Xtest)[:, 1]
     train_report = classification_report(
-        ytrain, (train_proba >= CLASSIFICATION_THRESHOLD).astype(int), output_dict=True)
+        ytrain, (train_proba >= CLASSIFICATION_THRESHOLD).astype(int), output_dict=True
+    )
     test_report = classification_report(
-        ytest, (test_proba >= CLASSIFICATION_THRESHOLD).astype(int), output_dict=True)
+        ytest, (test_proba >= CLASSIFICATION_THRESHOLD).astype(int), output_dict=True
+    )
 
     metrics = {
         "train_accuracy": train_report["accuracy"],
@@ -101,17 +114,18 @@ with mlflow.start_run(run_name="production-training"):
     mlflow.log_metrics(metrics)
     print(json.dumps(metrics, indent=2))
 
-    # Save the model locally and keep it as an MLflow artifact
+    # Save the complete preprocessing + classifier pipeline.
     joblib.dump(best_model, MODEL_FILE)
     mlflow.log_artifact(MODEL_FILE, artifact_path="model")
 
-    # Write a small metrics summary that the workflow commits back to the repository
+    # Write a compact performance summary for the GitHub repository.
     with open(METRICS_FILE, "w") as f:
-        json.dump({"best_params": grid_search.best_params_,
-                   "threshold": CLASSIFICATION_THRESHOLD,
-                   "metrics": {k: round(v, 4) for k, v in metrics.items()}}, f, indent=2)
+        json.dump({
+            "best_params": grid_search.best_params_,
+            "threshold": CLASSIFICATION_THRESHOLD,
+            "metrics": {k: round(v, 4) for k, v in metrics.items()}
+        }, f, indent=2)
 
-# Register the best model in the Hugging Face model hub
 api.create_repo(repo_id=model_repo, repo_type="model", private=False, exist_ok=True)
 api.upload_file(
     path_or_fileobj=MODEL_FILE,

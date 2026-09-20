@@ -1,8 +1,7 @@
 """Clean the registered dataset, split it and upload the splits to Hugging Face."""
-import os
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, hf_hub_download
 
 DATASET_NAME = "tourism-package-prediction"
 TARGET = "ProdTaken"
@@ -11,8 +10,9 @@ SPLIT_FILES = ["Xtrain.csv", "Xtest.csv", "ytrain.csv", "ytest.csv"]
 api = HfApi()
 repo_id = f"{api.whoami()['name']}/{DATASET_NAME}"
 
-# Load the dataset directly from the Hugging Face data space
-df = pd.read_csv(f"hf://datasets/{repo_id}/tourism.csv")
+# Load the raw data from the Hugging Face dataset repository.
+raw_path = hf_hub_download(repo_id=repo_id, filename="tourism.csv", repo_type="dataset")
+df = pd.read_csv(raw_path)
 print("Loaded raw data:", df.shape)
 
 # Remove columns that carry no predictive information
@@ -28,25 +28,25 @@ df = df.drop_duplicates().dropna(subset=[TARGET])
 df[TARGET] = df[TARGET].astype(int)
 print("Cleaned data:", df.shape)
 
-# Categorical columns stay as raw strings; they are encoded inside the model pipeline,
-# so that training and the deployed app use exactly the same representation.
+# Keep categorical columns as raw strings; encoding belongs to the model pipeline.
 X = df.drop(columns=[TARGET])
 y = df[TARGET]
 
-# Stratification keeps the purchase ratio identical in both splits
+# Stratification preserves the purchase ratio in both splits.
 Xtrain, Xtest, ytrain, ytest = train_test_split(
     X, y, test_size=0.2, random_state=42, stratify=y
 )
 
-# Save the splits locally ...
+# Save the splits locally.
 Xtrain.to_csv("Xtrain.csv", index=False)
 Xtest.to_csv("Xtest.csv", index=False)
 ytrain.to_csv("ytrain.csv", index=False)
 ytest.to_csv("ytest.csv", index=False)
+
 print("Train:", Xtrain.shape, "| Test:", Xtest.shape)
 print("Purchase rate train/test:", round(ytrain.mean(), 3), "/", round(ytest.mean(), 3))
 
-# ... and upload them back to the Hugging Face data space
+# Upload the prepared splits back to the Hugging Face data space.
 for file_name in SPLIT_FILES:
     api.upload_file(
         path_or_fileobj=file_name,
@@ -55,4 +55,5 @@ for file_name in SPLIT_FILES:
         repo_type="dataset",
         commit_message=f"Update {file_name}",
     )
+
 print(f"Splits uploaded to https://huggingface.co/datasets/{repo_id}")
